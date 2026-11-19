@@ -851,148 +851,184 @@ Object.keys(SECTIONS).forEach(k => {
   DATA[k] = {TT0:cp(S.tt), TT_ORIG:cp(S.tt), SUBJ:S.subj, SUBJ0:new Set(Object.keys(S.subj)), ALT:[],
              baseKey:'sit_ise_'+k.toLowerCase()+'_base', storeKey:'sit_ise_'+k.toLowerCase()+'_alts'};
 });
-// Netlify serverless API. Blobs stores timetable events only; teacher auth is separate.
-const API_URL = '/.netlify/functions/timetable';
-let netlifyReady = true;
-const remoteVersions = {G:0,H:0};
-const remoteAlts = {G:[],H:[]};
-const seenKey = sec => 'sit_timetable_seen_'+sec;
-let syncTimer = null;
+/* ===== NETLIFY BLOBS JSON STORAGE (TIMETABLE CHANGES ONLY) ===== */
+const BLOB_ENDPOINT = '/.netlify/functions/timetable-changes';
+const remoteVersions = { G: 0, H: 0 };
+const seenKey = sec => 'sit_timetable_seen_' + sec;
+
 function refreshStudentNoticeDot(){
-  const dot = document.getElementById('studentNoticeDot'); if (!dot) return;
+  const dot = document.getElementById('studentNoticeDot');
+  if (!dot) return;
   const unread = ['G','H'].some(sec => remoteVersions[sec] > Number(localStorage.getItem(seenKey(sec)) || 0));
   dot.classList.toggle('visible', unread);
   dot.title = unread ? 'You have unread timetable updates' : 'No unread timetable updates';
 }
+
 function markSectionUpdatesRead(sec){
   try { localStorage.setItem(seenKey(sec), String(remoteVersions[sec] || 0)); } catch(_){}
   refreshStudentNoticeDot();
 }
-async function apiRequest(url, options={}){
-  const headers = Object.assign({'Content-Type':'application/json'}, options.headers || {});
-  const token = sessionStorage.getItem('sit_teacher_token');
-  if (token) headers.Authorization = 'Bearer '+token;
-  const response = await fetch(url, Object.assign({}, options, {headers}));
-  const data = await response.json().catch(()=>({error:'Invalid server response'}));
-  if (!response.ok) throw new Error(data.error || 'Server request failed ('+response.status+')');
-  return data;
-}
-function altTargetKey(item){
-  if (item.type === 'extra') return 'extra:'+item.id;
-  return [item.type, item.scope || '', item.date || '', item.day || '', Number(item.s)].join(':');
-}
-function newEventId(){
-  if (crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID().replace(/-/g,'');
-  return uid()+Math.random().toString(36).slice(2)+Date.now().toString(36);
-}
-async function pullTimetable(sec, quiet=false){
+
+function loadStore(sec){
+  sec = sec || SEC;
   try {
-    const data = await apiRequest(API_URL+'?section='+encodeURIComponent(sec));
-    const D = DATA[sec], record = data && data.record;
-    if (!record) {
-      remoteAlts[sec] = [];
-      const label = document.getElementById('studentSyncStatus');
-      if (label) label.textContent = 'Connected · shared timetable storage is ready.';
-      return;
+    const v = JSON.parse(localStorage.getItem(DATA[sec].storeKey) || '[]');
+    if (Array.isArray(v)){
+      DATA[sec].ALT = v;
+      if (sec === SEC) ALT = v;
     }
-    const version = Number(record.version || 0), previous = remoteVersions[sec];
-    // Ignore an older overlapping poll response so a slow request cannot roll back the UI.
-    if (version < previous) return;
-    remoteVersions[sec] = version;
-    if (localStorage.getItem(seenKey(sec)) === null) localStorage.setItem(seenKey(sec), String(version));
-    else if (version > previous) refreshStudentNoticeDot();
-    if (record.base) applyBase(record.base, sec);
-    if (Array.isArray(record.alts)) {
-      remoteAlts[sec] = clone(record.alts);
-      D.ALT = clone(record.alts);
-    }
-    try { localStorage.setItem(D.storeKey, JSON.stringify(D.ALT)); if (record.base) localStorage.setItem(D.baseKey, JSON.stringify(record.base)); } catch(_){ }
-    if (SEC === sec) { ALT = D.ALT; refresh(); if (wDirty && !T) bzLoad(); }
-    refreshStudentNoticeDot();
-    const label = document.getElementById('studentSyncStatus');
-    if (label) label.textContent = 'Connected · shared timetable updates sync across devices.';
-  } catch(err) {
-    if (!quiet) console.warn('Timetable sync:', err);
-    const label = document.getElementById('studentSyncStatus');
-    if (label && !navigator.onLine) label.textContent = 'Offline · showing the last saved timetable on this device.';
-  }
-}
-function startRealtimeTimetableSync(){
-  ['G','H'].forEach(sec => { if (localStorage.getItem(seenKey(sec)) === null) localStorage.setItem(seenKey(sec), '0'); });
-  pullTimetable('G', true); pullTimetable('H', true);
-  if (syncTimer) clearInterval(syncTimer);
-  syncTimer = setInterval(() => { pullTimetable('G', true); pullTimetable('H', true); }, 5000);
-}
-let SEC = 'G', weekOff = 0, modeFn = null, curMode = 'home';
-// Live pointers to the currently selected section's data (re-pointed by useSection)
-let TT0 = DATA.G.TT0, TT_ORIG = DATA.G.TT_ORIG, SUBJ = DATA.G.SUBJ, SUBJ0 = DATA.G.SUBJ0, ALT = DATA.G.ALT;
-let GROUPS = SECTIONS.G.groups, SLOT_START = SLOT_ALL.slice(0, SECTIONS.G.slots);
-const TT = {};
-const TTcur = {};
-const ymd = d => d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
-const wkDate = (day, off) => { const d = new Date(); d.setHours(0,0,0,0); d.setDate(d.getDate() - ((d.getDay()+6)%7) + off*7 + DAYS.indexOf(day)); return d; };
-const shortDate = d => d.toLocaleDateString(undefined,{day:'numeric',month:'short'});
-function dayList(day, dt){
-  const list = TT0[day].map(x => Object.assign({o:x.s}, x));
-  ALT.filter(a => a.type !== 'extra' && (a.scope === 'weekly' ? a.day === day : a.date === dt))
-    .sort((a,b) => (a.scope === 'weekly' ? 0 : 1) - (b.scope === 'weekly' ? 0 : 1))
-    .forEach(a => {
-      const x = list.find(z => z.o === a.s); if (!x) return;
-      if (a.type === 'cancel') x.cancelled = true;
-      else if (a.type === 'change'){
-        if (a.code){ x.code = a.code; delete x.lab; delete x.free; }
-        if (a.ns != null){ x.s = a.ns; x.e = a.ne; }
-        x.changed = true;
-      }
-    });
-  ALT.filter(a => a.type === 'extra' && a.date === dt).forEach(a => list.push({s:a.s,e:a.e,o:a.s,code:a.code,extra:true,aid:a.id}));
-  return list.sort((p,q) => p.s - q.s);
-}
-function recompute(){ DAYS.forEach(d => { TT[d] = dayList(d, ymd(wkDate(d, weekOff))); TTcur[d] = dayList(d, ymd(wkDate(d, 0))); }); }
-function loadStore(sec){ sec = sec || SEC; try { const v = JSON.parse(localStorage.getItem(DATA[sec].storeKey) || '[]'); if (Array.isArray(v)){ DATA[sec].ALT = v; if (sec === SEC) ALT = v; } } catch(_){} }
-function baseData(){ const subj = {}; Object.keys(SUBJ).forEach(k => { if (!SUBJ0.has(k)) subj[k] = SUBJ[k]; }); return {tt:TT0, subj:subj}; }
-function applyBase(v, sec){ if (!v || !v.tt) return; const D = DATA[sec || SEC]; Object.assign(D.SUBJ, v.subj || {}); DAYS.forEach(d => { D.TT0[d] = Array.isArray(v.tt[d]) ? v.tt[d] : []; }); }
-function loadBase(sec){ sec = sec || SEC; try { applyBase(JSON.parse(localStorage.getItem(DATA[sec].baseKey) || 'null'), sec); } catch(_){} }
-async function saveStore(options={}){
-  DATA[SEC].ALT = ALT;
-  try { localStorage.setItem(DATA[SEC].storeKey, JSON.stringify(ALT)); localStorage.setItem(DATA[SEC].baseKey, JSON.stringify(baseData())); } catch(_){ }
-  if (!T || !sessionStorage.getItem('sit_teacher_token')) return false;
-  const section = SEC, before = remoteAlts[section] || [], beforeMap = new Map(before.map(item => [altTargetKey(item), item]));
-  const afterMap = new Map(ALT.map(item => [altTargetKey(item), item]));
-  const operations = [];
-  for (const [key, item] of afterMap) {
-    const prior = beforeMap.get(key);
-    if (!prior || JSON.stringify(prior) !== JSON.stringify(item)) operations.push({kind:'alt-upsert', item:clone(item), eventId:newEventId()});
-  }
-  for (const key of beforeMap.keys()) {
-    if (!afterMap.has(key)) operations.push({kind:'alt-delete', target:key, eventId:newEventId()});
-  }
-  if (options.publishBase) operations.push({kind:'base-set', base:baseData(), eventId:newEventId()});
-  if (!operations.length) return true;
-  try {
-    await apiRequest(API_URL, {method:'POST', body:JSON.stringify({section, operations})});
-    // Read the merged event log back: concurrent edits to other slots are merged in.
-    await pullTimetable(section, true);
-    return true;
-  } catch(err) {
-    console.error('Timetable publish failed:', err);
-    alert('Could not publish timetable online: '+err.message+'. Your changes remain saved in this browser.');
-    return false;
-  }
-}
-function refresh(){
-  todayKey = weekOff === 0 ? realToday : null;
-  recompute(); state.sel = null; state.room = null;
-  renderTabs(); renderTT(); updateTodayDashboard(); showRoute();
-  $('#wkLabel').textContent = shortDate(wkDate('Mon',weekOff))+' – '+shortDate(wkDate('Sat',weekOff))+(weekOff === 0 ? ' · this week' : '');
-  if (window.renderTP) window.renderTP();
-}
-function renderExtras(){
-  const o = [];
-  DAYS.forEach(d => dayEntries(d).forEach(x => { if (!x.free && !SLOT_START.includes(x.s)) o.push(d+' '+fmt(x.s)+'–'+fmt(x.e)+' · '+(x.code || 'Lab')+(x.cancelled ? ' (cancelled)' : x.extra ? ' (extra)' : ' (rescheduled)')); }));
-  $('#ttextra').textContent = o.length ? 'Outside the standard grid this week: '+o.join('; ') : '';
+  } catch(_){}
 }
 
+// Only stores changed/custom base timetable & non-default subjects (changes only)
+function changesPayload(){
+  const subj = {};
+  Object.keys(SUBJ).forEach(k => {
+    if (!SUBJ0.has(k) || JSON.stringify(SUBJ[k]) !== JSON.stringify(SECTIONS[SEC].subj[k])) {
+      subj[k] = SUBJ[k];
+    }
+  });
+  const tt = {};
+  let hasTtChange = false;
+  DAYS.forEach(d => {
+    if (JSON.stringify(TT0[d]) !== JSON.stringify(TT_ORIG[d])) {
+      tt[d] = TT0[d];
+      hasTtChange = true;
+    }
+  });
+  const base = (hasTtChange || Object.keys(subj).length)
+    ? { tt: hasTtChange ? tt : null, subj }
+    : null;
+  return { base, alts: cp(ALT) };
+}
+
+function applyChangesDoc(sec, doc){
+  if (!doc) return;
+  const D = DATA[sec];
+  const version = Number(doc.version || 0);
+  const prevVersion = remoteVersions[sec];
+  remoteVersions[sec] = version;
+
+  if (localStorage.getItem(seenKey(sec)) === null) {
+    try { localStorage.setItem(seenKey(sec), String(version)); } catch(_){}
+  } else if (version > prevVersion) {
+    refreshStudentNoticeDot();
+  }
+
+  // Reset to original static section timetable first, then layer stored changes on top
+  D.TT0 = cp(SECTIONS[sec].tt);
+  D.SUBJ = cp(SECTIONS[sec].subj);
+
+  const ch = doc.changes || {};
+  if (ch.base) {
+    if (ch.base.subj) Object.assign(D.SUBJ, ch.base.subj);
+    if (ch.base.tt) {
+      DAYS.forEach(d => {
+        if (Array.isArray(ch.base.tt[d])) D.TT0[d] = cp(ch.base.tt[d]);
+      });
+    }
+  }
+
+  D.ALT = Array.isArray(ch.alts) ? cp(ch.alts) : [];
+
+  try {
+    localStorage.setItem(D.storeKey, JSON.stringify(D.ALT));
+    localStorage.setItem(D.baseKey, JSON.stringify(ch.base || null));
+  } catch(_){}
+
+  if (SEC === sec) {
+    TT0 = D.TT0;
+    SUBJ = D.SUBJ;
+    ALT = D.ALT;
+    refresh();
+  }
+  refreshStudentNoticeDot();
+}
+
+function baseData(){
+  return changesPayload().base || { tt: null, subj: {} };
+}
+
+function applyBase(v, sec){
+  if (!v) return;
+  const D = DATA[sec || SEC];
+  if (v.subj) Object.assign(D.SUBJ, v.subj);
+  if (v.tt) {
+    DAYS.forEach(d => {
+      if (Array.isArray(v.tt[d])) D.TT0[d] = cp(v.tt[d]);
+    });
+  }
+}
+
+function loadBase(sec){
+  sec = sec || SEC;
+  try { applyBase(JSON.parse(localStorage.getItem(DATA[sec].baseKey) || 'null'), sec); } catch(_){}
+}
+
+function saveStore(){
+  const section = SEC;
+  const changes = changesPayload();
+  DATA[section].ALT = changes.alts;
+
+  try {
+    localStorage.setItem(DATA[section].storeKey, JSON.stringify(changes.alts));
+    localStorage.setItem(DATA[section].baseKey, JSON.stringify(changes.base));
+  } catch(_){}
+
+  return fetch(BLOB_ENDPOINT, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      section,
+      updatedBy: (typeof T !== 'undefined' && T && T.name) ? T.name : 'Teacher',
+      changes
+    })
+  })
+    .then(res => {
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    })
+    .then(doc => {
+      applyChangesDoc(section, doc);
+      return true;
+    })
+    .catch(err => {
+      console.error('Netlify Blob timetable save failed:', err);
+      return false;
+    });
+}
+
+async function fetchTimetableChanges(sec){
+  const query = sec ? ('?section=' + encodeURIComponent(sec)) : '';
+  const res = await fetch(BLOB_ENDPOINT + query, { cache: 'no-store' });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+
+function startRealtimeTimetableSync(){
+  ['G','H'].forEach(sec => {
+    if (localStorage.getItem(seenKey(sec)) === null) {
+      try { localStorage.setItem(seenKey(sec), '0'); } catch(_){}
+    }
+  });
+
+  const label = document.getElementById('studentSyncStatus');
+
+  const syncNow = () => {
+    fetchTimetableChanges()
+      .then(all => {
+        if (all && all.G) applyChangesDoc('G', all.G);
+        if (all && all.H) applyChangesDoc('H', all.H);
+        if (label) label.textContent = 'Timetable changes synced from Netlify Blobs.';
+      })
+      .catch(() => {
+        if (label) label.textContent = 'Showing cached timetable changes (offline or local preview).';
+      });
+  };
+
+  syncNow();
+  setInterval(syncNow, 30000);
+}
 
 /* =====================================================================
    4) CODE — the part below: graph, Dijkstra, map drawing, UI
